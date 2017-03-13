@@ -19,6 +19,7 @@
 -behaviour(supervisor2).
 
 -export([start_link/0, start_queue_process/3]).
+-export([start_for_vhost/1, stop_for_vhost/1]).
 
 -export([init/1]).
 
@@ -47,3 +48,17 @@ init([]) ->
     {ok, {{simple_one_for_one, 10, 10},
           [{rabbit_amqqueue_sup, {rabbit_amqqueue_sup, start_link, []},
             temporary, ?SUPERVISOR_WAIT, supervisor, [rabbit_amqqueue_sup]}]}}.
+
+
+start_for_vhost(VHost) ->
+    {ok, VHostSup} = rabbit_vhost_sup:vhost_sup(VHost),
+    supervisor:start_child(
+        VHostSup,
+        {rabbit_amqqueue_sup_sup,
+         {rabbit_amqqueue_sup_sup, start_link, []},
+         transient, infinity, supervisor, [rabbit_amqqueue_sup_sup]}).
+
+stop_for_vhost(VHost) ->
+    {ok, VHostSup} = rabbit_vhost_sup:vhost_sup(VHost),
+    ok = supervisor:terminate_child(VHostSup, rabbit_amqqueue_sup_sup),
+    ok = supervisor:delete_child(VHostSup, rabbit_amqqueue_sup_sup).

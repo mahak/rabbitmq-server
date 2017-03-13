@@ -1404,6 +1404,7 @@ handle_info({'DOWN', _MonitorRef, process, DownPid, _Reason},
     stop(State);
 
 handle_info({'DOWN', _MonitorRef, process, DownPid, _Reason}, State) ->
+rabbit_log:info("DOWN signal from ~p~n    Reason ~p~n", [DownPid, _Reason]),
     case handle_ch_down(DownPid, State) of
         {ok, State1}   -> noreply(State1);
         {stop, State1} -> stop(State1)

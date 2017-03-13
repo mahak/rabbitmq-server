@@ -491,6 +491,7 @@ client_init(Server, Ref, MsgOnDiskFun, CloseFDsFun) when is_pid(Server); is_atom
         gen_server2:call(
           Server, {new_client_state, Ref, self(), MsgOnDiskFun, CloseFDsFun},
           infinity),
+    % link(Server),
     CreditDiscBound = rabbit_misc:get_env(rabbit, msg_store_credit_disc_bound,
                                           ?CREDIT_DISC_BOUND),
     #client_msstate { server             = Server,
@@ -968,8 +969,23 @@ handle_info({'DOWN', _MRef, process, Pid, _Reason}, State) ->
     credit_flow:peer_down(Pid),
     noreply(State);
 
-handle_info({'EXIT', _Pid, Reason}, State) ->
-    {stop, Reason, State}.
+%% Ignore normal exists.
+handle_info({'EXIT', _Pid, normal}, State) ->
+    noreply(State);
+%% Ignore client exists to provide one-way links to client processes.
+handle_info({'EXIT', Pid, Reason}, State = #msstate{ clients = Clients }) ->
+    PidIsClient = dict:fold(
+        fun (_Key, _Val, true) -> true;
+            (_Key, {CPid, _, _}, false) when CPid == Pid -> true;
+            (_Key, _Val, false) -> false
+        end,
+        false,
+        Clients),
+
+    case PidIsClient of
+        true  -> noreply(State);
+        false -> {stop, Reason, State}
+    end.
 
 terminate(_Reason, State = #msstate { index_state         = IndexState,
                                       index_module        = IndexModule,

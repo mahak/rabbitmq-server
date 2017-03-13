@@ -30,9 +30,6 @@
 
 -export([start/1, stop/0]).
 
-%% exported for parallel map
--export([add_vhost_msg_store/1]).
-
 %% exported for testing only
 -export([start_msg_store/2, stop_msg_store/0, init/6]).
 
@@ -507,11 +504,6 @@ stop() ->
     ok = rabbit_queue_index:stop().
 
 start_msg_store(Refs, StartFunState) when is_map(Refs); Refs == undefined ->
-    ok = rabbit_sup:start_child(?TRANSIENT_MSG_STORE_SUP, rabbit_msg_store_vhost_sup,
-                                [?TRANSIENT_MSG_STORE_SUP,
-                                 undefined,  {fun (ok) -> finished end, ok}]),
-    ok = rabbit_sup:start_child(?PERSISTENT_MSG_STORE_SUP, rabbit_msg_store_vhost_sup,
-                                [?PERSISTENT_MSG_STORE_SUP, Refs, StartFunState]),
     %% Start message store for all known vhosts
     VHosts = rabbit_vhost:list(),
     %% TODO: recovery is limited by queue index recovery
@@ -519,24 +511,46 @@ start_msg_store(Refs, StartFunState) when is_map(Refs); Refs == undefined ->
     %% recovery until there will be a queue index
     %% recovery pool per vhost
     lists:foreach(fun(Vhost) ->
-        add_vhost_msg_store(Vhost)
+        add_vhost_msg_store(Vhost, [
+            {?TRANSIENT_MSG_STORE_SUP, undefined, {fun (ok) -> finished end, ok}},
+            {?PERSISTENT_MSG_STORE_SUP, Refs, StartFunState}])
     end,
     lists:sort(VHosts)),
     ok.
 
-add_vhost_msg_store(VHost) ->
+add_vhost_msg_store(VHost, MsgStores) ->
     rabbit_log:info("Starting message stores for vhost '~s'~n", [VHost]),
-    rabbit_msg_store_vhost_sup:add_vhost(?TRANSIENT_MSG_STORE_SUP, VHost),
-    rabbit_msg_store_vhost_sup:add_vhost(?PERSISTENT_MSG_STORE_SUP, VHost),
+    lists:foreach(fun({Type, Refs, StartFunState}) ->
+        VHostRefs = refs_for_vhost(Refs, VHost),
+        VHostStartFunState = start_fun_state_for_vhost(StartFunState, VHost),
+        {ok, _} = rabbit_vhost_msg_store:start(VHost, Type, VHostRefs, VHostStartFunState)
+    end,
+    MsgStores),
     rabbit_log:info("Message stores for vhost '~s' are started~n", [VHost]).
 
+start_fun_state_for_vhost({Fun, {start, [#resource{}|_] = QNames}}, VHost) ->
+    QNamesForVHost = [QName || QName = #resource{virtual_host = VH} <- QNames,
+                               VH == VHost ],
+    {Fun, {start, QNamesForVHost}};
+start_fun_state_for_vhost(State, _VHost) -> State.
+
+refs_for_vhost(undefined, _VHost) -> undefined;
+refs_for_vhost(Refs, VHost) ->
+    case maps:find(VHost, Refs) of
+        {ok, Val} -> Val;
+        error -> []
+    end.
+
 stop_msg_store() ->
-    ok = rabbit_sup:stop_child(?PERSISTENT_MSG_STORE_SUP),
-    ok = rabbit_sup:stop_child(?TRANSIENT_MSG_STORE_SUP).
+    VHosts = rabbit_vhost:list(),
+    lists:foreach(fun(VHost) ->
+        stop_vhost_msg_store(VHost)
+    end,
+    VHosts).
 
 stop_vhost_msg_store(VHost) ->
-    rabbit_msg_store_vhost_sup:delete_vhost(?TRANSIENT_MSG_STORE_SUP, VHost),
-    rabbit_msg_store_vhost_sup:delete_vhost(?PERSISTENT_MSG_STORE_SUP, VHost),
+    rabbit_vhost_msg_store:stop(VHost, ?TRANSIENT_MSG_STORE_SUP),
+    rabbit_vhost_msg_store:stop(VHost, ?PERSISTENT_MSG_STORE_SUP),
     ok.
 
 init(Queue, Recover, Callback) ->
@@ -585,8 +599,9 @@ init(#amqqueue { name = QueueName, durable = IsDurable }, Terms,
     {DeltaCount, DeltaBytes, IndexState} =
         rabbit_queue_index:recover(
           QueueName, RecoveryTerms,
-          rabbit_msg_store_vhost_sup:successfully_recovered_state(
-              ?PERSISTENT_MSG_STORE_SUP, VHost),
+          rabbit_vhost_msg_store:successfully_recovered_state(
+              VHost,
+              ?PERSISTENT_MSG_STORE_SUP),
           ContainsCheckFun, MsgIdxOnDiskFun, MsgAndIdxOnDiskFun),
     init(IsDurable, IndexState, DeltaCount, DeltaBytes, RecoveryTerms,
          PersistentClient, TransientClient).
@@ -1271,11 +1286,11 @@ msg_store_client_init(MsgStore, MsgOnDiskFun, Callback, VHost) ->
 
 msg_store_client_init(MsgStore, Ref, MsgOnDiskFun, Callback, VHost) ->
     CloseFDsFun = msg_store_close_fds_fun(MsgStore =:= ?PERSISTENT_MSG_STORE_SUP),
-    rabbit_msg_store_vhost_sup:client_init(MsgStore, Ref, MsgOnDiskFun,
-                                           fun () ->
-                                               Callback(?MODULE, CloseFDsFun)
-                                           end,
-                                           VHost).
+    rabbit_vhost_msg_store:client_init(VHost, MsgStore,
+                                       Ref, MsgOnDiskFun,
+                                       fun () ->
+                                           Callback(?MODULE, CloseFDsFun)
+                                       end).
 
 msg_store_write(MSCState, IsPersistent, MsgId, Msg) ->
     with_immutable_msg_store_state(
@@ -2771,8 +2786,8 @@ multiple_routing_keys() ->
 
 %% Assumes message store is not running
 transform_storage(TransformFun) ->
-    transform_store(?PERSISTENT_MSG_STORE_SUP, TransformFun),
-    transform_store(?TRANSIENT_MSG_STORE_SUP, TransformFun).
+    transform_store(?PERSISTENT_MSG_STORE, TransformFun),
+    transform_store(?TRANSIENT_MSG_STORE, TransformFun).
 
 transform_store(Store, TransformFun) ->
     rabbit_msg_store:force_recovery(rabbit_mnesia:dir(), Store),
@@ -2794,17 +2809,15 @@ move_messages_to_vhost_store() ->
     {QueuesWithTerms, RecoveryRefs, StartFunState} = start_recovery_terms(Queues),
 
     OldStore = run_old_persistent_store(RecoveryRefs, StartFunState),
+
+    VHosts = rabbit_vhost:list(),
+
     %% New store should not be recovered.
-    NewStoreSup = start_new_store_sup(),
-    Vhosts = rabbit_vhost:list(),
-    lists:foreach(fun(VHost) ->
-        rabbit_msg_store_vhost_sup:add_vhost(NewStoreSup, VHost)
-    end,
-    Vhosts),
+    ok = start_new_store(VHosts),
     MigrationBatchSize = application:get_env(rabbit, queue_migration_batch_size,
                                              ?QUEUE_MIGRATION_BATCH_SIZE),
     in_batches(MigrationBatchSize,
-        {rabbit_variable_queue, migrate_queue, [OldStore, NewStoreSup]},
+        {rabbit_variable_queue, migrate_queue, [OldStore]},
         QueuesWithTerms,
         "message_store upgrades: Migrating batch ~p of ~p queues. Out of total ~p ~n",
         "message_store upgrades: Batch ~p of ~p queues migrated ~n. ~p total left"),
@@ -2813,7 +2826,7 @@ move_messages_to_vhost_store() ->
     delete_old_store(OldStore),
 
     ok = rabbit_queue_index:stop(),
-    ok = rabbit_sup:stop_child(NewStoreSup),
+    ok = stop_new_store(VHosts),
     ok.
 
 in_batches(Size, MFA, List, MessageStart, MessageEnd) ->
@@ -2840,12 +2853,12 @@ in_batches(Size, BatchNum, MFA, List, MessageStart, MessageEnd) ->
     rabbit_log:info(MessageEnd, [BatchNum, Size, length(Tail)]),
     in_batches(Size, BatchNum + 1, MFA, Tail, MessageStart, MessageEnd).
 
-migrate_queue({QueueName = #resource{virtual_host = VHost, name = Name}, RecoveryTerm}, OldStore, NewStoreSup) ->
+migrate_queue({QueueName = #resource{virtual_host = VHost, name = Name}, RecoveryTerm}, OldStore) ->
     log_upgrade_verbose(
         "Migrating messages in queue ~s in vhost ~s to per-vhost message store~n",
         [Name, VHost]),
     OldStoreClient = get_global_store_client(OldStore),
-    NewStoreClient = get_per_vhost_store_client(QueueName, NewStoreSup),
+    NewStoreClient = get_per_vhost_store_client(QueueName),
     %% WARNING: During scan_queue_segments queue index state is being recovered
     %% and terminated. This can cause side effects!
     rabbit_queue_index:scan_queue_segments(
@@ -2881,12 +2894,11 @@ migrate_message(MsgId, OldC, NewC) ->
         _ -> OldC
     end.
 
-get_per_vhost_store_client(#resource{virtual_host = VHost}, NewStoreSup) ->
-    rabbit_msg_store_vhost_sup:client_init(NewStoreSup,
-                                           rabbit_guid:gen(),
-                                           fun(_,_) -> ok end,
-                                           fun() -> ok end,
-                                           VHost).
+get_per_vhost_store_client(#resource{virtual_host = VHost}) ->
+    rabbit_vhost_msg_store:client_init(VHost, ?PERSISTENT_MSG_STORE_SUP,
+                                       rabbit_guid:gen(),
+                                       fun(_,_) -> ok end,
+                                       fun() -> ok end).
 
 get_global_store_client(OldStore) ->
     rabbit_msg_store:client_init(OldStore,
@@ -2923,13 +2935,23 @@ run_old_persistent_store(Refs, StartFunState) ->
                                  Refs, StartFunState]),
     OldStoreName.
 
-start_new_store_sup() ->
-    % Start persistent store sup without recovery.
-    ok = rabbit_sup:start_child(?PERSISTENT_MSG_STORE_SUP,
-                                rabbit_msg_store_vhost_sup,
-                                [?PERSISTENT_MSG_STORE_SUP,
-                                 undefined,  {fun (ok) -> finished end, ok}]),
-    ?PERSISTENT_MSG_STORE_SUP.
+start_new_store(VHosts) ->
+    %% Ensure vhost supervisor is started, so we can add vhsots to it.
+    ok = rabbit_vhost_sup_sup:ensure_started(),
+    lists:foreach(fun(VHost) ->
+        % Start persistent store without recovery.
+        {ok, _} = rabbit_vhost_msg_store:start(VHost, [
+            {?PERSISTENT_MSG_STORE_SUP, undefined, {fun (ok) -> finished end, ok}}])
+    end,
+    VHosts),
+    ok.
+
+stop_new_store(VHosts) ->
+    lists:foreach(fun(VHost) ->
+        ok = rabbit_vhost_msg_store:stop(VHost, ?PERSISTENT_MSG_STORE_SUP)
+    end,
+    VHosts),
+    ok.
 
 delete_old_store(OldStore) ->
     ok = rabbit_sup:stop_child(OldStore),
