@@ -21,18 +21,17 @@
 -export([start/4, stop/2, client_init/5, successfully_recovered_state/2]).
 
 
-start(VHost, Type, ClientRefs, StartupFunState) when is_map(ClientRefs);
+start(VHost, Type, ClientRefs, StartupFunState) when is_list(ClientRefs);
                                                      ClientRefs == undefined  ->
-    {ok, VHostSup} = rabbit_vhost_sup:vhost_sup(VHost),
+    {ok, VHostSup} = rabbit_vhost_sup_sup:vhost_sup(VHost),
     VHostDir = rabbit_vhost:msg_store_dir_path(VHost),
-    rabbit_log:info("Making sure message store directory '~s' for vhost '~s' exists~n", [VHostDir, VHost]),
-    ok = rabbit_file:ensure_dir(VHostDir),
     supervisor2:start_child(VHostSup,
         {Type, {rabbit_msg_store, start_link,
-                [Type, VHostDir, ClientRefs, StartupFunState]}}).
+                [Type, VHostDir, ClientRefs, StartupFunState]},
+         transient, ?WORKER_WAIT, worker, [rabbit_msg_store]}).
 
 stop(VHost, Type) ->
-    {ok, VHostSup} = rabbit_vhost_sup:vhost_sup(VHost),
+    {ok, VHostSup} = rabbit_vhost_sup_sup:vhost_sup(VHost),
     ok = supervisor2:terminate_child(VHostSup, Type),
     ok = supervisor2:delete_child(VHostSup, Type).
 
@@ -50,7 +49,7 @@ with_vhost_store(VHost, Type, Fun) ->
     end.
 
 vhost_store_pid(VHost, Type) ->
-    {ok, VHostSup} = rabbit_vhost_sup:vhost_sup(VHost),
+    {ok, VHostSup} = rabbit_vhost_sup_sup:vhost_sup(VHost),
     case supervisor2:find_child(VHostSup, Type) of
         [Pid] -> Pid;
         []    -> no_pid

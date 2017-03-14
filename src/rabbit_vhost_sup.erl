@@ -28,4 +28,4 @@ start_link(VHost) ->
     supervisor2:start_link(?MODULE, [VHost]).
 
 init([_VHost]) ->
-    {ok, {{one_for_one, 1, 5}, []}}.
+    {ok, {{one_for_all, 0, 1}, []}}.

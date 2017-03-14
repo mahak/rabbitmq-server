@@ -20,6 +20,7 @@
 
 %%----------------------------------------------------------------------------
 
+-export([recover/0, recover/1]).
 -export([add/2, delete/2, exists/1, list/0, with/2, assert/1, update/2,
          set_limits/2, limits_of/1]).
 -export([info/1, info/2, info_all/0, info_all/1, info_all/2, info_all/3]).
@@ -41,6 +42,36 @@
 -spec info_all(rabbit_types:info_keys()) -> [rabbit_types:infos()].
 -spec info_all(rabbit_types:info_keys(), reference(), pid()) ->
                          'ok'.
+
+recover() ->
+    %% Clear out remnants of old incarnation, in case we restarted
+    %% faster than other nodes handled DOWN messages from us.
+    rabbit_amqqueue:on_node_down(node()),
+
+    rabbit_amqqueue:warn_file_limit(),
+    %% rabbit_vhost_sup_sup will start the actual recovery.
+    %% So recovery will be run every time a vhost supervisor is restarted.
+    ok = rabbit_vhost_sup_sup:start(),
+    [{ok, _} = rabbit_vhost_sup_sup:vhost_sup(VHost)
+     || VHost <- rabbit_vhost:list()],
+    ok.
+
+recover(VHost) ->
+    VHostDir = rabbit_vhost:msg_store_dir_path(VHost),
+    rabbit_log:info("Making sure data directory '~s' for vhost '~s' exists~n",
+                    [VHostDir, VHost]),
+    VHostStubFile = filename:join(VHostDir, ".vhost"),
+    ok = rabbit_file:ensure_dir(VHostStubFile),
+    ok = file:write_file(VHostStubFile, VHost),
+rabbit_log:info("Starting vhost ~p~n", [VHost]),
+    Qs = rabbit_amqqueue:recover(VHost),
+rabbit_log:info("Queues recovered for vhost ~p~n", [VHost]),
+    ok = rabbit_binding:recover(rabbit_exchange:recover(VHost),
+                                [QName || #amqqueue{name = QName} <- Qs]),
+rabbit_log:info("Bindings recovered for vhost ~p~n", [VHost]),
+    ok = rabbit_amqqueue:start(Qs),
+rabbit_log:info("Queues started for vhost ~p~n", [VHost]),
+    ok.
 
 %%----------------------------------------------------------------------------
 

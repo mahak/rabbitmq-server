@@ -22,19 +22,12 @@
 
 -export([init/1]).
 
--export([start_link/0, start/0, ensure_started/0]).
--export([vhost_sup/1]).
+-export([start_link/0, start/0]).
+-export([vhost_sup/1, vhost_sup/2]).
 -export([start_vhost/1]).
 
 start() ->
     rabbit_sup:start_supervisor_child(?MODULE).
-
-ensure_started() ->
-    case start() of
-        ok                            -> ok;
-        {error, {already_started, _}} -> ok;
-        Other                         -> Other
-    end.
 
 start_link() ->
     supervisor2:start_link({local, ?MODULE}, ?MODULE, []).
@@ -47,24 +40,35 @@ init([]) ->
             [rabbit_vhost_sup_sup, rabbit_vhost_sup]}]}}.
 
 start_vhost(VHost) ->
-    case vhost_pid(VHost) of
-        no_pid ->
-            case rabbit_vhost_sup:start_link(VHost) of
-                {ok, Pid} ->
-                    ok = save_vhost_pid(VHost, Pid),
-                    {ok, Pid};
-                Other     -> Other
-            end;
-        Pid when is_pid(Pid) ->
-            {error, {already_started, Pid}}
+    case rabbit_vhost_sup:start_link(VHost) of
+        {ok, Pid} ->
+            ok = save_vhost_pid(VHost, Pid),
+            ok = rabbit_vhost:recover(VHost),
+            {ok, Pid};
+        Other     -> Other
+    end.
+
+vhost_sup(VHost, Local) when Local == node(self()) ->
+    vhost_sup(VHost);
+vhost_sup(VHost, Node) ->
+    case rabbit_misc:rpc_call(Node, rabbit_vhost_sup_sup, vhost_sup, [VHost]) of
+        {ok, Pid} when is_pid(Pid) ->
+            {ok, Pid};
+        {badrpc, RpcErr} ->
+            {error, RpcErr}
     end.
 
 -spec vhost_sup(rabbit_types:vhost()) -> {ok, pid()}.
 vhost_sup(VHost) ->
-    case supervisor2:start_child(?MODULE, [VHost]) of
-        {ok, Pid}                       -> {ok, Pid};
-        {error, {already_started, Pid}} -> {ok, Pid};
-        Error                           -> throw(Error)
+    case vhost_pid(VHost) of
+        no_pid ->
+            case supervisor2:start_child(?MODULE, [VHost]) of
+                {ok, Pid}                       -> {ok, Pid};
+                {error, {already_started, Pid}} -> {ok, Pid};
+                Error                           -> throw(Error)
+            end;
+        Pid when is_pid(Pid) ->
+            {ok, Pid}
     end.
 
 save_vhost_pid(VHost, Pid) ->

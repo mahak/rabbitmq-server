@@ -37,11 +37,12 @@
 %%----------------------------------------------------------------------------
 
 start_link() ->
-    supervisor2:start_link({local, ?SERVER}, ?MODULE, []).
+    supervisor2:start_link(?MODULE, []).
 
 start_queue_process(Node, Q, StartMode) ->
-    {ok, _SupPid, QPid} = supervisor2:start_child(
-                            {?SERVER, Node}, [Q, StartMode]),
+    #amqqueue{name = #resource{virtual_host = VHost}} = Q,
+    {ok, Sup} = find_for_vhost(VHost, Node),
+    {ok, _SupPid, QPid} = supervisor2:start_child(Sup, [Q, StartMode]),
     QPid.
 
 init([]) ->
@@ -49,16 +50,20 @@ init([]) ->
           [{rabbit_amqqueue_sup, {rabbit_amqqueue_sup, start_link, []},
             temporary, ?SUPERVISOR_WAIT, supervisor, [rabbit_amqqueue_sup]}]}}.
 
+find_for_vhost(VHost, Node) ->
+    {ok, VHostSup} = rabbit_vhost_sup_sup:vhost_sup(VHost, Node),
+    [QSup] = supervisor2:find_child(VHostSup, rabbit_amqqueue_sup_sup),
+    {ok, QSup}.
 
 start_for_vhost(VHost) ->
-    {ok, VHostSup} = rabbit_vhost_sup:vhost_sup(VHost),
-    supervisor:start_child(
+    {ok, VHostSup} = rabbit_vhost_sup_sup:vhost_sup(VHost),
+    supervisor2:start_child(
         VHostSup,
         {rabbit_amqqueue_sup_sup,
          {rabbit_amqqueue_sup_sup, start_link, []},
          transient, infinity, supervisor, [rabbit_amqqueue_sup_sup]}).
 
 stop_for_vhost(VHost) ->
-    {ok, VHostSup} = rabbit_vhost_sup:vhost_sup(VHost),
-    ok = supervisor:terminate_child(VHostSup, rabbit_amqqueue_sup_sup),
-    ok = supervisor:delete_child(VHostSup, rabbit_amqqueue_sup_sup).
+    {ok, VHostSup} = rabbit_vhost_sup_sup:vhost_sup(VHost),
+    ok = supervisor2:terminate_child(VHostSup, rabbit_amqqueue_sup_sup),
+    ok = supervisor2:delete_child(VHostSup, rabbit_amqqueue_sup_sup).

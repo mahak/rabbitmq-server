@@ -214,6 +214,7 @@
 %%----------------------------------------------------------------------------
 
 start(DurableQueues) ->
+%% TODO: per-vhost start/stop
     {AllTerms, StartFunState} = rabbit_queue_index:start(DurableQueues),
     %% Group recovery terms by vhost.
     {[], VhostRefs} = lists:foldl(
